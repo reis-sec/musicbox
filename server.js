@@ -263,20 +263,27 @@ async function seedAdmin() {
 }
 
 function getMysqlConfig() {
-  const host = process.env.MYSQL_HOST || "127.0.0.1";
-  const user = process.env.MYSQL_USER || "";
-  const password = process.env.MYSQL_PASSWORD || "";
-  const database = process.env.MYSQL_DATABASE || "";
-  const port = Number.parseInt(process.env.MYSQL_PORT || "3306", 10);
-  if (!user || !password || !database || !Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("Configure MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD e MYSQL_DATABASE no .env.");
+  const host = process.env.DB_HOST ?? process.env.MYSQL_HOST ?? "127.0.0.1";
+  const user = process.env.DB_USER ?? process.env.MYSQL_USER;
+  const password = process.env.DB_PASSWORD ?? process.env.MYSQL_PASSWORD;
+  const database = process.env.DB_NAME ?? process.env.MYSQL_DATABASE;
+  const port = Number(process.env.DB_PORT ?? process.env.MYSQL_PORT ?? "3306");
+  if (!host || !user || !password || !database || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Configure DB_HOST, DB_PORT, DB_USER, DB_PASSWORD e DB_NAME no .env.");
   }
   return { host, port, user, password, database };
 }
 
 async function start() {
+  const host = process.env.HOST || "127.0.0.1";
+  const port = Number(process.env.PORT || "3000");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Configure PORT com um número inteiro de 1 a 65535 no .env.");
+  }
+
+  const dbConfig = getMysqlConfig();
   pool = mysql.createPool({
-    ...getMysqlConfig(),
+    ...dbConfig,
     waitForConnections: true,
     connectionLimit: 6,
     queueLimit: 50,
@@ -299,13 +306,13 @@ async function start() {
   } catch (error) {
     await pool.end().catch(() => {});
     if (error.message?.startsWith("Configure ")) throw error;
-    throw new Error("Não foi possível conectar ao MySQL. Confira se o serviço está iniciado, se o banco existe e se MYSQL_USER/MYSQL_PASSWORD estão corretos no .env.");
+    const code = error.code || error.name;
+    throw new Error(`Falha ao iniciar o MySQL em ${dbConfig.host}:${dbConfig.port} (${code}). Confira rede, credenciais e permissões do banco.`);
   }
 
   const app = express();
-  const port = Number.parseInt(process.env.PORT || "3000", 10);
   app.disable("x-powered-by");
-  app.set("trust proxy", 1);
+  app.set("trust proxy", "loopback");
 
   app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -315,6 +322,16 @@ async function start() {
     res.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
     next();
   });
+  app.get("/api/health", async (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      await pool.query("SELECT 1");
+      res.json({ status: "ok", database: "connected" });
+    } catch {
+      res.status(503).json({ status: "unavailable", database: "disconnected" });
+    }
+  });
+
   app.use(express.static(PUBLIC_DIR, { index: false, maxAge: "1h" }));
   app.use(express.json({ limit: "16kb" }));
   app.use(asyncHandler(sessionMiddleware));
@@ -475,9 +492,16 @@ async function start() {
     res.status(500).json({ error: "O servidor encontrou um erro. Tente novamente." });
   });
 
-  const server = app.listen(port, "127.0.0.1", () => {
-    console.log(`MusicBox pronto em http://127.0.0.1:${port}`);
-    console.log("Para publicar pelo ngrok, em outro terminal execute: ngrok http " + port);
+  const server = app.listen(port, host);
+  server.once("listening", () => {
+    const address = server.address();
+    const urlHost = address.family === "IPv6" ? `[${address.address}]` : address.address;
+    console.log(`MusicBox escutando em http://${urlHost}:${address.port}`);
+  });
+  server.on("error", async (error) => {
+    console.error(`Não foi possível abrir o servidor HTTP em ${host}:${port} (${error.code || error.name}).`);
+    await pool.end().catch(() => {});
+    process.exitCode = 1;
   });
   const shutdown = () => server.close(async () => {
     await pool.end();
